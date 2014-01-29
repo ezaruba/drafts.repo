@@ -1,0 +1,189 @@
+assert = require \assert
+{EventEmitter} = require \events
+Bot = require \./bot
+Human = require \./human
+send = require \./db/send
+_ = require \./_
+genCube = require \./generate/cube
+genPack = require \./generate/pack
+Sets = require \../data/sets
+
+HOUR = 1e3 * 60 * 60
+drafts = {}
+
+do decrement = ->
+  for id, d in drafts
+    for p of d.players
+      if p.time and !--p.time
+        p.autopick!
+  setTimeout decrement, 1e3
+
+class Draft extends EventEmitter
+  ({cube, host, seats, sets, type}) ->
+    seats = Number <>
+    assert type of <[ cube draft sealed ]>
+    assert 1 <= seats <= 8
+    assert typeof host is \string
+    if type is \cube
+      assert !sets
+      assert typeof cube is \string
+    else
+      assert !cube
+      assert sets instanceof Array
+      n = if type is \draft then 3 else 6
+      assert sets.length is n
+      for set of sets
+        assert set in Sets
+
+    @ <<<< { cube, host, seats, sets, type }
+    @ <<<<
+      id: _.uid!
+      players: []
+      startTime: Date.now! / 1e3 | 0
+      timeout: setTimeout @end.bind(@, \timeout), HOUR
+    if cube
+      genCube that, seats * 3, (err, @cubePacks) ~>
+        if err
+          @end err
+        else if @state is \started
+          @start!
+
+  delta: -1
+  round: 0
+  state: \open
+
+  join: (sock) ->
+    {id} = sock
+    for p of @players
+      if p.id is id
+        if p.dropped
+          p.send \error 'you were dropped'
+          return
+        p.attach sock
+        p.send \set @{ round }
+        @meta!
+        return
+
+    unless @state is \open
+      return sock.send \error 'draft started'
+
+    if @players.length is @seats
+      return sock.send \error 'draft full'
+
+    h = new Human sock, sock.id is @host
+
+    h.on \meta @~meta
+    h.on \drop @~drop
+
+    if h.isHost
+      h.once \start (@addBots) ~>
+        @state = \started
+        unless @type is \cube and !@cubePacks
+          @start!
+
+    @add h
+    @meta!
+
+  add: (p) ->
+    @players.push p
+    p.on \pass @~pass
+
+  drop: (h) ->
+    return unless @state is \open
+
+    h.removeAllListeners!
+    @players = _.without <>, h
+    @meta!
+
+  send: !(name, args) ->
+    for p of @players
+      p.send name, args
+
+  meta: !->
+    # TODO only send time + packs
+    players = for p of @players
+      { p.dropped, p.hash, p.name, p.time, packs: p.packs.length }
+    for p, i of @players
+      p.send \set { players, self: i }
+
+  start: ->
+    clearTimeout @timeout
+    @timeout = setTimeout @end.bind(@, \timeout), HOUR
+
+    if @type is \sealed
+      @round = 4
+      for p of @players
+        cards = for @sets => genPack &
+        cards = _.flat <>
+        p[p.zone] = cards
+        p.send \set { (p.zone): cards, @round }
+      return
+
+    drafts[@id] = @
+
+    if @addBots
+      while @players.length < @seats
+        @add new Bot
+
+    _.shuffle @players
+
+    for p, i of @players
+      p.index = i
+
+    @startRound!
+    @meta!
+
+  startRound: !->
+    r = ++@round
+    @send \set round: r
+    if r is 4
+      return @end!
+
+    if @sets
+      set = that[r - 1]
+
+    @delta *= -1
+    @activePacks = @players.length
+
+    for p of @players
+      p.startRound!
+      p.receive if @cubePacks
+        that.pop!
+      else
+        genPack set
+
+  pass: (pack, index) ->
+    player = _.at @players, index + @delta
+
+    if pack.length
+      player.receive pack
+    else if !--@activePacks
+      @startRound!
+
+    # TODO ignore bot, dropped passes
+    @meta!
+
+  end: (err) ->
+    clearTimeout @timeout
+    delete drafts[@id]
+
+    if err
+      @emit \end
+      @send \error err
+      return
+
+    setTimeout (~> @emit \end), HOUR
+
+    data =
+      start: @startTime
+      end: Date.now! / 1e3 | 0
+    data.players = for p of @players
+      p{ isBot, picks }
+    if @sets
+      data.sets = that
+    else
+      data.cube = @cube
+
+    send data
+
+module.exports = Draft

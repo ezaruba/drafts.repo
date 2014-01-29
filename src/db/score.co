@@ -1,0 +1,20 @@
+fs = require \fs
+request = require \request
+Cards = require \../../data/cards
+
+try
+  {origin} = require \../../data/couch
+catch
+  {origin} = require \../../couch/couch
+
+console.log "fetching data from #origin"
+
+options =
+  json: true
+  uri: "#origin/draft/_design/draft/_view/score?group=true"
+
+request options, (err, res, data) ->
+  throw err if err
+  for {key, value} of data.rows
+    Cards[key]?score = value.sum / value.count
+  fs.writeFileSync \data/cards.json JSON.stringify Cards, null 2
